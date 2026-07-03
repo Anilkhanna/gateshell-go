@@ -3,22 +3,29 @@ package collector
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-// This file is the intended landing spot for ports of the iOS Swift local
-// health parsers (GateShell/Services/ServerHealthService.swift and friends)
-// down to a Linux-first, /proc-based implementation. Only LoadAvgReader and
-// UptimeReader are wired up for real today; everything else is a stub that
-// returns zero values so the collector compiles and runs end-to-end while
-// the real parsers are built out.
+// This file is the landing spot for ports of the iOS Swift local health
+// parsers (GateShell/Services/Parsers/*.swift and friends) down to a
+// Linux-first, /proc-based implementation.
 //
 // Linux is the primary target (the agent runs on user servers, which are
 // overwhelmingly Linux). macOS support below is a best-effort fallback for
 // local development only -- it is NOT a target deployment platform for v1.
+// Every reader below follows the same shape: real work gated behind
+// `runtime.GOOS == "linux"`, zero/empty values (no error) otherwise, so the
+// package builds and runs end-to-end on a macOS dev machine too. The raw
+// text/JSON parsing for each reader lives in its own file (meminfo.go,
+// cpustat.go, netdev.go, psparse.go, diskusage.go) as pure functions so it
+// can be unit-tested against captured sample output without touching the
+// filesystem or shelling out.
 
 // LoadAvgReader reads system load averages (1/5/15 min).
 type LoadAvgReader struct{}
@@ -86,115 +93,211 @@ func (UptimeReader) Read() (time.Duration, error) {
 	return time.Duration(seconds * float64(time.Second)), nil
 }
 
-// MemoryReader reads memory usage (used/total, MB).
-//
-// TODO(MemoryParser): port of the iOS Swift MemoryParser. On Linux, parse
-// /proc/meminfo (MemTotal, MemAvailable) to compute used = total - available.
+// MemoryReader reads memory usage (used/total, MB) from /proc/meminfo.
 type MemoryReader struct{}
 
-// Read returns usedMB, totalMB.
+// Read returns usedMB, totalMB. On Linux it parses /proc/meminfo, using
+// MemTotal and MemAvailable (used = total - available); MemAvailable is a
+// kernel-computed "truly free for a new workload" figure, closer to what
+// users mean by "used" than MemTotal-MemFree (which ignores reclaimable
+// caches). See meminfo.go for the pure parser.
 func (MemoryReader) Read() (usedMB, totalMB float64, err error) {
-	// TODO: parse /proc/meminfo on Linux.
-	return 0, 0, nil
+	if runtime.GOOS != "linux" {
+		return 0, 0, nil
+	}
+
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0, 0, fmt.Errorf("reading /proc/meminfo: %w", err)
+	}
+
+	totalKB, availKB, err := parseMemInfo(string(data))
+	if err != nil {
+		return 0, 0, err
+	}
+
+	totalMB = float64(totalKB) / 1024
+	usedKB := int64(totalKB) - int64(availKB)
+	if usedKB < 0 {
+		usedKB = 0
+	}
+	usedMB = float64(usedKB) / 1024
+	return usedMB, totalMB, nil
 }
 
-// DiskReader reads disk usage for a given mount point (used/total, GB).
-//
-// TODO(DiskParser): port of the iOS Swift DiskParser. On Linux, use
-// golang.org/x/sys/unix.Statfs on the target path, or shell out to `df`.
+// DiskReader reads disk usage for a given mount point (used/total, GB) via
+// the statfs(2) syscall.
 type DiskReader struct{}
 
-// Read returns usedGB, totalGB for the given mount path (e.g. "/").
+// Read returns usedGB, totalGB for the given mount path (e.g. "/"). An
+// empty path defaults to "/". See diskusage.go for the pure GB conversion.
 func (DiskReader) Read(path string) (usedGB, totalGB float64, err error) {
-	// TODO: implement via unix.Statfs(path, &stat) or `df -k path`.
-	return 0, 0, nil
+	if runtime.GOOS != "linux" {
+		return 0, 0, nil
+	}
+	if path == "" {
+		path = "/"
+	}
+
+	var stat unix.Statfs_t
+	if err := unix.Statfs(path, &stat); err != nil {
+		return 0, 0, fmt.Errorf("statfs %s: %w", path, err)
+	}
+
+	usedGB, totalGB = calcDiskUsage(uint64(stat.Bsize), stat.Blocks, stat.Bavail)
+	return usedGB, totalGB, nil
 }
 
 // CPUReader reads aggregate CPU utilization as a percentage (0-100).
-//
-// TODO(CPUParser): port of the iOS Swift CPUParser. On Linux, sample
-// /proc/stat twice with a short interval and compute the delta of
-// (user+nice+system+...) vs idle+iowait.
-type CPUReader struct{}
-
-// Read returns the current aggregate CPU percentage.
-func (CPUReader) Read() (percent float64, err error) {
-	// TODO: implement via two /proc/stat samples across a short interval.
-	return 0, nil
+type CPUReader struct {
+	// SampleInterval is the delay between the two /proc/stat samples used
+	// to compute the delta-based CPU percentage. Zero uses
+	// defaultCPUSampleInterval; tests override this to avoid slow runs.
+	SampleInterval time.Duration
 }
 
-// NetReader reads network throughput (bytes/sec) since the last sample.
-//
-// TODO: port of the iOS Swift network throughput logic. On Linux, parse
-// /proc/net/dev and diff cumulative rx/tx byte counters across ticks.
-type NetReader struct{}
+// Read samples /proc/stat twice, SampleInterval apart, and returns the
+// busy percentage across that window (busy = total ticks - idle ticks).
+// See cpustat.go for the pure parsing/percentage math.
+func (r CPUReader) Read() (percent float64, err error) {
+	if runtime.GOOS != "linux" {
+		return 0, nil
+	}
 
-// Read returns rxBytesPerSec, txBytesPerSec.
-func (NetReader) Read() (rxBytesPerSec, txBytesPerSec float64, err error) {
-	// TODO: implement via /proc/net/dev diffing between collector ticks.
-	return 0, 0, nil
+	interval := r.SampleInterval
+	if interval <= 0 {
+		interval = defaultCPUSampleInterval
+	}
+
+	first, err := readProcStatCPU()
+	if err != nil {
+		return 0, err
+	}
+	time.Sleep(interval)
+	second, err := readProcStatCPU()
+	if err != nil {
+		return 0, err
+	}
+
+	return cpuPercent(first, second), nil
 }
 
-// TopProcessesReader reads the top-N processes by CPU/memory usage.
-//
-// TODO(TopProcessesParser): port of the iOS Swift TopProcessesParser. On
-// Linux, walk /proc/[pid]/stat and /proc/[pid]/status for each running PID.
+func readProcStatCPU() (cpuStat, error) {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return cpuStat{}, fmt.Errorf("reading /proc/stat: %w", err)
+	}
+	stat, err := parseCPUStatLine(string(data))
+	if err != nil {
+		return cpuStat{}, err
+	}
+	return stat, nil
+}
+
+// NetReader reads network throughput (bytes/sec) on the primary
+// non-loopback interface.
+type NetReader struct {
+	// SampleInterval is the delay between the two /proc/net/dev samples
+	// used to compute a bytes/sec rate. Zero uses
+	// defaultNetSampleInterval; tests override this to avoid slow runs.
+	SampleInterval time.Duration
+}
+
+// Read samples /proc/net/dev twice, SampleInterval apart, and returns the
+// rx/tx byte-rate delta over that window for the first non-loopback
+// interface found. If no such interface is present, it returns 0, 0, nil
+// (nothing to report, not an error). See netdev.go for the pure parser.
+func (r NetReader) Read() (rxBytesPerSec, txBytesPerSec float64, err error) {
+	if runtime.GOOS != "linux" {
+		return 0, 0, nil
+	}
+
+	interval := r.SampleInterval
+	if interval <= 0 {
+		interval = defaultNetSampleInterval
+	}
+
+	first, ok, err := readProcNetDev()
+	if err != nil {
+		return 0, 0, err
+	}
+	if !ok {
+		return 0, 0, nil
+	}
+	time.Sleep(interval)
+	second, ok, err := readProcNetDev()
+	if err != nil {
+		return 0, 0, err
+	}
+	if !ok {
+		return 0, 0, nil
+	}
+
+	elapsed := interval.Seconds()
+	if elapsed <= 0 {
+		return 0, 0, nil
+	}
+	rxBytesPerSec = nonNegativeDelta(second.rxBytes, first.rxBytes) / elapsed
+	txBytesPerSec = nonNegativeDelta(second.txBytes, first.txBytes) / elapsed
+	return rxBytesPerSec, txBytesPerSec, nil
+}
+
+func readProcNetDev() (netIface, bool, error) {
+	data, err := os.ReadFile("/proc/net/dev")
+	if err != nil {
+		return netIface{}, false, fmt.Errorf("reading /proc/net/dev: %w", err)
+	}
+	iface, ok := parseNetDev(string(data))
+	return iface, ok, nil
+}
+
+// nonNegativeDelta returns curr-prev, floored at 0 -- counters can appear
+// to go backward across a sample window if the interface was reset.
+func nonNegativeDelta(curr, prev uint64) float64 {
+	if curr < prev {
+		return 0
+	}
+	return float64(curr - prev)
+}
+
+// TopProcessesReader reads the top-N processes by CPU usage.
 type TopProcessesReader struct{}
 
-// Read returns up to n ProcessInfo entries, sorted by CPU usage descending.
+// Read shells out to `ps -eo pid,comm,%cpu,rss --sort=-%cpu` (already
+// sorted CPU-descending by the kernel/ps, not re-sorted here) and returns
+// the first n rows. rss (resident set size, KB) is used instead of %mem so
+// ProcessInfo.MemMB is a direct unit conversion rather than a
+// percent-of-total that would need a second RAM lookup to convert. See
+// psparse.go for the pure parser.
 func (TopProcessesReader) Read(n int) ([]ProcessInfo, error) {
-	// TODO: implement via /proc/[pid] walk.
-	return nil, nil
+	if runtime.GOOS != "linux" {
+		return nil, nil
+	}
+	if n <= 0 {
+		n = 5
+	}
+
+	out, err := exec.Command("ps", "-eo", "pid,comm,%cpu,rss", "--sort=-%cpu").Output()
+	if err != nil {
+		return nil, fmt.Errorf("running ps: %w", err)
+	}
+
+	procs, err := parsePS(string(out))
+	if err != nil {
+		return nil, err
+	}
+	if len(procs) > n {
+		procs = procs[:n]
+	}
+	return procs, nil
 }
 
 // ServiceChecker probes the health of external service supervisors
-// (docker, systemd, pm2, cron). Each concrete checker below is a stub that
-// returns an empty slice; wiring these up requires shelling out to (or
-// linking against) the respective tool's status API.
+// (docker, systemd, pm2, cron). Concrete implementations live in
+// docker.go, systemd.go, pm2.go, and cron.go respectively -- each shells
+// out to the corresponding local tool and reports an empty slice (not an
+// error) when that tool isn't installed or reachable.
 type ServiceChecker interface {
 	Kind() ServiceKind
 	Check() ([]ServiceStatus, error)
-}
-
-// DockerServiceChecker probes `docker ps` / the Docker Engine API.
-//
-// TODO: implement via the Docker Engine API (unix socket) or `docker ps
-// --format json` if we want to avoid an SDK dependency.
-type DockerServiceChecker struct{}
-
-func (DockerServiceChecker) Kind() ServiceKind { return ServiceKindDocker }
-func (DockerServiceChecker) Check() ([]ServiceStatus, error) {
-	return nil, nil
-}
-
-// SystemdServiceChecker probes `systemctl` unit status.
-//
-// TODO: implement via `systemctl show <unit> --property=ActiveState` or by
-// talking to systemd over D-Bus.
-type SystemdServiceChecker struct{}
-
-func (SystemdServiceChecker) Kind() ServiceKind { return ServiceKindSystemd }
-func (SystemdServiceChecker) Check() ([]ServiceStatus, error) {
-	return nil, nil
-}
-
-// PM2ServiceChecker probes `pm2 jlist` for Node.js process status.
-//
-// TODO: implement via `pm2 jlist` (JSON) parsing.
-type PM2ServiceChecker struct{}
-
-func (PM2ServiceChecker) Kind() ServiceKind { return ServiceKindPM2 }
-func (PM2ServiceChecker) Check() ([]ServiceStatus, error) {
-	return nil, nil
-}
-
-// CronServiceChecker inspects cron job health (e.g. via a heartbeat file
-// convention, or crontab -l presence).
-//
-// TODO: define and implement a concrete health signal for cron jobs.
-type CronServiceChecker struct{}
-
-func (CronServiceChecker) Kind() ServiceKind { return ServiceKindCron }
-func (CronServiceChecker) Check() ([]ServiceStatus, error) {
-	return nil, nil
 }
