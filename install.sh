@@ -126,7 +126,7 @@ cat >"$CONFIG_FILE" <<EOF
 {
   "listen_addr": "${LISTEN_ADDR}",
   "db_path": "${DATA_DIR}/gateshell-agent.db",
-  "poll_interval": "15s",
+  "poll_interval": "5m",
   "ntfy_topic": "${NTFY_TOPIC}",
   "server_name": "$(hostname)"
 }

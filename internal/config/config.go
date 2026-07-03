@@ -18,7 +18,7 @@ import (
 const (
 	DefaultListenAddr   = ":8443"
 	DefaultDBPath       = "gateshell-agent.db"
-	DefaultPollInterval = 15 * time.Second
+	DefaultPollInterval = 5 * time.Minute
 	DefaultServerName   = "gateshell-agent"
 )
 
