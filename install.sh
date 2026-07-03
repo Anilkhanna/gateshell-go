@@ -30,7 +30,7 @@ SERVICE_USER="gateshell-agent"
 REPO="Anilkhanna/gateshell-go" # binaries published via GitHub Releases
 TOKEN=""
 NTFY_TOPIC=""
-LISTEN_ADDR=":8443"
+LISTEN_ADDR="127.0.0.1:8443"
 VERSION="latest" # TODO: pin/resolve a real version once releases are published
 
 # ---- arg parsing -------------------------------------------------------

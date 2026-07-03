@@ -16,7 +16,7 @@ import (
 
 // Default values used when a setting is not supplied by any other source.
 const (
-	DefaultListenAddr   = ":8443"
+	DefaultListenAddr   = "127.0.0.1:8443"
 	DefaultDBPath       = "gateshell-agent.db"
 	DefaultPollInterval = 5 * time.Minute
 	DefaultServerName   = "gateshell-agent"

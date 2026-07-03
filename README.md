@@ -2,9 +2,12 @@
 
 An **optional**, self-hosted binary that runs *on* your own server. It has no
 web UI and does not phone home anywhere except the ntfy topic you configure
-for alerts. Network reachability of the agent's API (port-forwarding,
-reverse proxy, VPN, Tailscale, etc.) is entirely up to you — the agent just
-binds a listen address and serves.
+for alerts. It binds **`127.0.0.1` only** — it is *not* reachable from the
+network, so there is no exposed port for anyone to hit. The GateShell app
+reaches it over the SSH connection it already has to your server (an
+SSH-tunnelled, encrypted, host-key-verified channel), so access requires your
+server's SSH credentials — only your app can read the data. The bearer token is
+kept as defense-in-depth for other local processes on the box.
 
 This is a standalone, **open-source** Go module — published so you can audit
 exactly what runs on your server before you install it. Release binaries are
@@ -130,7 +133,7 @@ Generate a pairing token, then run the server:
 ./bin/gateshell-agent pair
 # -> prints a token; paste it into the mobile app's pairing screen
 
-./bin/gateshell-agent serve --token <TOKEN> --listen-addr :8443
+./bin/gateshell-agent serve --token <TOKEN> --listen-addr 127.0.0.1:8443
 ```
 
 Configuration can come from flags, environment variables
