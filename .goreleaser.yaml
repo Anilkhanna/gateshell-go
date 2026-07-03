@@ -1,0 +1,53 @@
+# GoReleaser config for gateshell-agent.
+#
+# TODO: this targets goreleaser's v2 schema; run `goreleaser check` once
+# release infra (GitHub Actions workflow, signing keys, download host) is
+# actually wired up. Until then this is a scaffold documenting the intended
+# cross-compile matrix and build flags, not a verified release pipeline.
+version: 2
+
+project_name: gateshell-agent
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: gateshell-agent
+    main: ./cmd/gateshell-agent
+    binary: gateshell-agent
+    # Always build with the sqlite (durable) store -- the default,
+    # untagged build is a dev/CI-only convenience, never a release
+    # artifact. See internal/store's package doc.
+    flags:
+      - -tags=sqlite
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    env:
+      - CGO_ENABLED=0 # modernc.org/sqlite is pure Go; no cgo toolchain needed
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    # macOS is a dev convenience for local testing; the agent's primary
+    # deployment target is Linux servers. All four combinations below are
+    # still built so `gateshell-agent-darwin-arm64` etc. exist for
+    # developers on Apple Silicon / Intel Macs.
+
+archives:
+  - id: gateshell-agent
+    # Raw single binaries so install.sh can curl one file from GitHub Releases.
+    formats: [binary]
+    name_template: "{{ .ProjectName }}-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+# TODO: wire up `release.extra_files` or a separate publish step to also
+# push raw (non-archived) binaries to https://gateshell.com/dl/ under the
+# `gateshell-agent-<os>-<arch>` naming convention install.sh expects --
+# goreleaser's default GitHub release upload only publishes the archives
+# above.

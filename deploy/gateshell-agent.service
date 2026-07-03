@@ -1,0 +1,30 @@
+[Unit]
+Description=GateShell Agent — optional self-hosted metrics + alerting sidecar
+Documentation=https://gateshell.com/agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gateshell-agent
+Group=gateshell-agent
+
+# EnvironmentFile carries the pairing token and any other secrets so they
+# never appear in `systemctl status` / `ps` output. install.sh writes this
+# for you; see internal/config for the full list of GATESHELL_AGENT_* vars.
+EnvironmentFile=/etc/gateshell-agent/gateshell-agent.env
+
+ExecStart=/usr/local/bin/gateshell-agent serve --config /etc/gateshell-agent/config.json
+Restart=on-failure
+RestartSec=5s
+
+# Basic hardening. Loosen ProtectSystem/ReadWritePaths if DBPath lives
+# outside /var/lib/gateshell-agent.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/gateshell-agent
+
+[Install]
+WantedBy=multi-user.target
