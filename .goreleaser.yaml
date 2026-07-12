@@ -46,8 +46,17 @@ archives:
 checksum:
   name_template: "checksums.txt"
 
-# TODO: wire up `release.extra_files` or a separate publish step to also
-# push raw (non-archived) binaries to https://gateshell.com/dl/ under the
-# `gateshell-agent-<os>-<arch>` naming convention install.sh expects --
-# goreleaser's default GitHub release upload only publishes the archives
-# above.
+release:
+  # install.sh falls back to fetching the systemd unit from the same
+  # release channel as the binary (for curl|sh one-liner installs where
+  # deploy/ isn't present locally) -- publish it alongside the binaries so
+  # that fetch actually resolves instead of 404ing.
+  extra_files:
+    - glob: deploy/gateshell-agent.service
+
+# TODO: wire up a separate publish step to also push raw (non-archived)
+# binaries to https://gateshell.com/dl/ under the `gateshell-agent-<os>-<arch>`
+# naming convention install.sh expects -- goreleaser's default GitHub release
+# upload (above) publishes to GitHub Releases, which install.sh already reads
+# from directly, so this TODO is about mirroring to the website too, not a
+# blocker for install.sh working today.

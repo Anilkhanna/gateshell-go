@@ -2,8 +2,9 @@
 # install.sh — one-line installer for gateshell-agent.
 #
 #   curl -fsSL https://gateshell.com/dl/install-agent.sh | sh -s -- --token <PAIRING_TOKEN>
+#   curl -fsSL https://gateshell.com/dl/install-agent.sh | sh -s -- --uninstall
 #
-# What this does:
+# What --token (install) does:
 #   1. Detects OS/arch and downloads the matching release binary.
 #   2. Installs it to /usr/local/bin/gateshell-agent.
 #   3. Writes a config file + env file containing the pairing token.
@@ -12,6 +13,11 @@
 # Idempotent: safe to re-run (e.g. to upgrade, or to rotate the token with
 # --token). Re-running replaces the binary and config, then restarts the
 # service.
+#
+# What --uninstall does: stops + disables the service, then removes the
+# systemd unit, binary, config/data directories, and the service user.
+# Idempotent — safe to run even if the agent was never installed (each step
+# no-ops if its target doesn't exist).
 #
 # NOTE: this script targets systemd-based Linux distros, matching the
 # agent's primary deployment target (see deploy/gateshell-agent.service).
@@ -27,11 +33,13 @@ INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/gateshell-agent"
 DATA_DIR="/var/lib/gateshell-agent"
 SERVICE_USER="gateshell-agent"
+SERVICE_FILE="/etc/systemd/system/gateshell-agent.service"
 REPO="Anilkhanna/gateshell-go" # binaries published via GitHub Releases
 TOKEN=""
 NTFY_TOPIC=""
 LISTEN_ADDR="127.0.0.1:8443"
-VERSION="latest" # TODO: pin/resolve a real version once releases are published
+VERSION="latest"
+UNINSTALL=0
 
 # ---- arg parsing -------------------------------------------------------
 while [ $# -gt 0 ]; do
@@ -52,6 +60,10 @@ while [ $# -gt 0 ]; do
 		VERSION="$2"
 		shift 2
 		;;
+	--uninstall)
+		UNINSTALL=1
+		shift
+		;;
 	*)
 		echo "unknown argument: $1" >&2
 		exit 1
@@ -59,6 +71,52 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
+# ---- privilege check (both paths need it) ---------------------------------
+if [ "$(id -u)" -ne 0 ]; then
+	echo "error: this script must be run as root (it manages a systemd unit and a service user)" >&2
+	exit 1
+fi
+
+# ---- uninstall path ---------------------------------------------------
+if [ "$UNINSTALL" -eq 1 ]; then
+	echo "==> Uninstalling gateshell-agent"
+
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl stop gateshell-agent 2>/dev/null || true
+		systemctl disable gateshell-agent 2>/dev/null || true
+	fi
+
+	if [ -f "$SERVICE_FILE" ]; then
+		rm -f "$SERVICE_FILE"
+		command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+		echo "==> Removed ${SERVICE_FILE}"
+	fi
+
+	if [ -f "${INSTALL_DIR}/gateshell-agent" ]; then
+		rm -f "${INSTALL_DIR}/gateshell-agent"
+		echo "==> Removed ${INSTALL_DIR}/gateshell-agent"
+	fi
+
+	if [ -d "$CONFIG_DIR" ]; then
+		rm -rf "$CONFIG_DIR"
+		echo "==> Removed ${CONFIG_DIR}"
+	fi
+
+	if [ -d "$DATA_DIR" ]; then
+		rm -rf "$DATA_DIR"
+		echo "==> Removed ${DATA_DIR}"
+	fi
+
+	if id "$SERVICE_USER" >/dev/null 2>&1; then
+		userdel "$SERVICE_USER" 2>/dev/null || true
+		echo "==> Removed system user '$SERVICE_USER'"
+	fi
+
+	echo "==> gateshell-agent uninstalled."
+	exit 0
+fi
+
+# ---- install path -------------------------------------------------------
 if [ -z "$TOKEN" ]; then
 	echo "error: --token <PAIRING_TOKEN> is required (generate one with 'gateshell-agent pair' on an existing install, or let the app generate one during setup)" >&2
 	exit 1
@@ -93,12 +151,6 @@ fi
 BINARY_URL="${DOWNLOAD_BASE_URL}/gateshell-agent-${OS}-${ARCH}"
 echo "==> Installing gateshell-agent ${VERSION} for ${OS}/${ARCH}"
 echo "    (source: ${BINARY_URL})"
-
-# ---- privilege check ------------------------------------------------------
-if [ "$(id -u)" -ne 0 ]; then
-	echo "error: this installer must be run as root (it installs a systemd unit and a service user)" >&2
-	exit 1
-fi
 
 # ---- service user (idempotent: only create if missing) --------------------
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
@@ -143,7 +195,6 @@ chown "$SERVICE_USER":"$SERVICE_USER" "$ENV_FILE"
 echo "==> Wrote ${ENV_FILE} (mode 600)"
 
 # ---- systemd unit (idempotent: overwritten on every run) ----------------
-SERVICE_FILE="/etc/systemd/system/gateshell-agent.service"
 if [ -f "$(dirname "$0")/deploy/gateshell-agent.service" ]; then
 	cp "$(dirname "$0")/deploy/gateshell-agent.service" "$SERVICE_FILE"
 else
